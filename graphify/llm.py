@@ -963,7 +963,21 @@ def _call_openai_compat(
             # heuristic) + 400 for the system prompt, then add output headroom.
             num_ctx = auto_num_ctx
         keep_alive = os.environ.get("GRAPHIFY_OLLAMA_KEEP_ALIVE", "30m")
-        kwargs["extra_body"] = {"options": {"num_ctx": num_ctx}, "keep_alive": keep_alive}
+        options = {"num_ctx": num_ctx}
+        # Cap CPU threads so a CPU-only host stays responsive while inferring
+        # (leave cores free for everything else). ponytail: opt-in; unset = Ollama's
+        # own default (all cores). Set GRAPHIFY_OLLAMA_NUM_THREAD=6 on an 8-core box.
+        num_thread_raw = os.environ.get("GRAPHIFY_OLLAMA_NUM_THREAD", "").strip()
+        if num_thread_raw.isdigit() and int(num_thread_raw) > 0:
+            options["num_thread"] = int(num_thread_raw)
+        kwargs["extra_body"] = {"options": options, "keep_alive": keep_alive}
+        # Force valid JSON. Small local models otherwise emit prose or truncated
+        # JSON, which graphify reads as a hollow response and bisects the chunk —
+        # an expensive 8x retry loop that pins a CPU-only host. Ollama's
+        # OpenAI-compatible endpoint honours response_format json_object. Opt out
+        # with GRAPHIFY_OLLAMA_NO_JSON_MODE=1 for models that don't support it.
+        if os.environ.get("GRAPHIFY_OLLAMA_NO_JSON_MODE", "").strip() != "1":
+            kwargs["response_format"] = {"type": "json_object"}
     resp = client.chat.completions.create(**kwargs)
     if not resp.choices or resp.choices[0].message is None:
         raise ValueError("LLM returned empty or filtered response")
