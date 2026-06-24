@@ -79,6 +79,29 @@ def download_audio(url: str, output_dir: Path) -> Path:
         'postprocessors': [],  # no ffmpeg needed — use native audio
     }
 
+    # YouTube blocks datacenter/VPS IPs with a "confirm you're not a bot" wall.
+    # Pass a cookies.txt (Netscape format) exported from a logged-in browser via
+    # GRAPHIFY_YTDLP_COOKIES to authenticate. ponytail: env-var passthrough only,
+    # not full yt-dlp option coverage — add more keys here if other sites need them.
+    cookies = os.environ.get("GRAPHIFY_YTDLP_COOKIES")
+    if cookies:
+        cookie_path = Path(cookies).expanduser()
+        if not cookie_path.is_file():
+            raise FileNotFoundError(
+                f"GRAPHIFY_YTDLP_COOKIES points to a missing file: {cookie_path}"
+            )
+        ydl_opts['cookiefile'] = str(cookie_path)
+
+    # YouTube's nsig "n-challenge" now requires running an external JavaScript
+    # solver (needs a JS runtime like Deno + yt-dlp's EJS solver script). Without
+    # it, only storyboards are returned. Opt in by setting
+    # GRAPHIFY_YTDLP_REMOTE_COMPONENTS="ejs:github" (comma-separated for several).
+    # ponytail: off by default because it fetches+runs third-party JS at runtime —
+    # a deliberate trust decision left to the operator.
+    components = os.environ.get("GRAPHIFY_YTDLP_REMOTE_COMPONENTS")
+    if components:
+        ydl_opts['remote_components'] = [c.strip() for c in components.split(',') if c.strip()]
+
     print(f"  downloading audio: {url[:80]} ...", flush=True)
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)

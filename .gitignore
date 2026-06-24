@@ -37,3 +37,7 @@ scripts/llm.py
 scripts/benchmark_kimi*.json
 scripts/benchmark_kimi*.py
 paper/
+cookies.txt
+# Local video/transcript test artifacts
+raw/
+video_input/
