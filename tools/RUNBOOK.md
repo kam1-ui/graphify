@@ -1,0 +1,105 @@
+# Runbook — Ingestion vidéo → graphe de connaissances → vault Obsidian
+
+Procédure standard, suivie de la même façon par un humain ou un agent. Chaque
+étape dit **qui paie** (local/gratuit vs Gemini/payant) et **comment vérifier**
+avant de continuer. Ne jamais sauter le preflight : c'est le garde-fou contre
+une facture surprise.
+
+> Règle absolue : **graphify est immuable.** Toute la valeur ajoutée vit dans
+> `tools/` (pré/post-processeurs). On ne patche jamais graphify pour une
+> intégration. On n'utilise jamais le skill `/graphify` ni `--backend claude-cli`
+> (ça brûle la session Claude Code).
+
+## Pré-requis (une fois)
+
+- Clé Gemini valide dans `~/.gemini/.env` (`GEMINI_API_KEY=...`).
+  **Vérifier qu'elle marche pour la *vraie* inférence** (pas juste lister les modèles) :
+  ```bash
+  K=$(grep -oE 'GEMINI_API_KEY=.*' ~/.gemini/.env | head -1 | cut -d= -f2- | tr -d '"')
+  curl -s "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$K" \
+    -H 'Content-Type: application/json' -d '{"contents":[{"parts":[{"text":"Reply OK"}]}]}' | head -c 120
+  ```
+  Doit renvoyer un `"candidates"` avec "OK". Un `401 ACCOUNT_STATE_INVALID` =
+  service account désactivé → régénérer la clé (jamais la coller en clair).
+- `yt-dlp` configuré (cookies + EJS) pour les téléchargements YouTube sur VPS.
+
+## Procédure
+
+Variables : `VIDEO_URL`, `WORK=<dossier de travail>`.
+
+### 1. Télécharger + transcrire — *local, gratuit*
+```bash
+# audio via yt-dlp (cookies/EJS déjà gérés par graphify/transcribe.py), puis
+# faster-whisper pour le texte. Sortie attendue : WORK/raw_transcript.txt
+```
+**Vérifier :** `raw_transcript.txt` existe et contient du texte.
+
+### 2. Nettoyer le transcript — *local, gratuit (LE gain coût)*
+```bash
+uv run python tools/clean.py "$WORK/raw_transcript.txt" --stats -o "$WORK/clean_transcript.txt"
+```
+**Vérifier :** `--stats` affiche une réduction (~30–40% sur du Whisper brut).
+Source déjà propre → 0%, c'est normal.
+
+### 3. Preflight — *local, gratuit (GARDE-FOU)*
+```bash
+uv run python tools/preflight.py "$WORK"
+```
+**Vérifier :** lis l'estimation. Si « QUE des docs/medias », l'extraction passera
+au modèle (payant). Code = gratuit. Ne lance le 4 que si le coût te convient.
+
+### 4. Chunker — *local, gratuit*
+```bash
+# Chonkie RecursiveChunker, chunk_size en CARACTÈRES (~4000 → chunks cohérents).
+# Sortie : WORK/chunked/part01.txt ...
+```
+**Vérifier :** quelques fichiers `partNN.txt`, pas 1 énorme ni 50 minuscules.
+
+### 5. Extraire le graphe — *Gemini Flash : SEULE étape payante*
+```bash
+K=$(grep -oE 'GEMINI_API_KEY=.*' ~/.gemini/.env | head -1 | cut -d= -f2- | tr -d '"')
+( cd "$WORK/chunked" && GEMINI_API_KEY="$K" \
+    graphify extract . --backend gemini --model gemini-2.5-flash )
+```
+**Vérifier :** « wrote graph.json: N nodes, M edges ». Note le coût affiché.
+⚠️ graphify opère sur le `graphify-out/` du **répertoire courant** — toujours
+`cd` dans le dossier des chunks avant de lancer.
+
+### 6. Clusteriser + nommer — *local + petit appel Gemini*
+```bash
+( cd "$WORK/chunked" && GEMINI_API_KEY="$K" graphify cluster-only . )
+```
+**Vérifier :** `GRAPH_REPORT.md` généré. Si le nommage LLM échoue
+(`Expecting value`), on garde « Community N » — non bloquant.
+
+### 7. Exporter le vault Obsidian — *local, gratuit*
+```bash
+( cd "$WORK/chunked" && graphify export obsidian . )
+```
+**Vérifier :** `graphify-out/obsidian/` contient une note `.md` par nœud.
+
+### 8. Câbler les sources — *local, gratuit (le "territory")*
+```bash
+uv run python tools/wire_sources.py "$WORK/chunked/graphify-out/obsidian" \
+    --src-dir "$WORK" \
+    --map "part:clean_transcript.txt"
+```
+**Vérifier :** « wired N note(s) ». Chaque note a une section `## Source` avec
+un lien cliquable `[[sources/...]]`. Re-lancer = 0 (idempotent).
+
+### 9. Ouvrir dans Obsidian
+Pointer Obsidian sur `…/graphify-out/obsidian/` (Open folder as vault). Cliquer
+un nœud → ses connexions → son document source. C'est le « map + territory ».
+
+## En cas de batch (plusieurs vidéos / 100h+)
+Boucler les étapes 1→8 par vidéo, un `WORK` par vidéo. Le preflight (3) cumule
+le coût. Fusionner les graphes ensuite avec `graphify merge-graphs` si on veut
+un seul vault. Garder code et docs en passes séparées (code = gratuit) pour ne
+payer Gemini que sur ce qui l'exige.
+
+## Limites connues / features à venir (branches séparées)
+- Timestamps : graphify jette les timestamps Whisper (`transcribe.py:178`).
+  Pour pointer « concept = 14:13 » → transcrire en direct avec faster-whisper
+  (sidecar) avant le nettoyage. Brique `transcribe_ts.py` à faire.
+- Langfuse (suivi coût batch), LiteLLM (routing modèles), Marker/Crawl4AI
+  (sources PDF/web) : Niveau 1, à brancher quand le besoin arrive.
