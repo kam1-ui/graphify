@@ -1,0 +1,9 @@
+# Code-only graph of this repo: skip every doc/image so Pass 3 (paid LLM)
+# never runs. Same syntax as .gitignore. Pass 1 (tree-sitter, free) still
+# maps all 221 code files.
+*.md
+*.yml
+*.yaml
+*.html
+*.svg
+docs/
