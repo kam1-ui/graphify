@@ -47,25 +47,19 @@ def _run(cmd: list[str], cwd: str | None = None) -> subprocess.CompletedProcess:
     return cp
 
 
-def _chunk(clean_path: Path, chunk_dir: Path, chunk_size: int) -> int:
-    """Chunk with Chonkie if available; else fall back to one chunk = whole file.
+def _stage_source(clean_path: Path, doc_name: str, scan_dir: Path) -> None:
+    """Place the whole cleaned doc where graphify will scan it.
 
-    ponytail: char-based RecursiveChunker (the gotcha we hit: chunk_size is in
-    CHARACTERS, not tokens). Fallback keeps the pipeline runnable without
-    Chonkie installed — the whole transcript becomes a single chunk.
+    We do NOT pre-chunk: graphify chunks natively by TOKEN budget
+    (_pack_chunks_by_tokens, llm.py), which is both more accurate than a
+    char-based pre-split and what actually drives cost. Pre-chunking with
+    Chonkie was redundant — graphify repacks everything by tokens anyway and a
+    char-split can cut mid-idea. Granularity is tuned with graphify's own
+    --token-budget, not by us. (Confirmed via the graphify graph: no Chonkie
+    inside graphify; _pack_chunks_by_tokens groups files by token budget.)
     """
-    chunk_dir.mkdir(parents=True, exist_ok=True)
-    text = clean_path.read_text(encoding="utf-8")
-    try:
-        from chonkie import RecursiveChunker  # type: ignore
-
-        chunks = [c.text for c in RecursiveChunker(chunk_size=chunk_size).chunk(text)]
-    except ImportError:
-        print("  (chonkie not installed — using one chunk)", flush=True)
-        chunks = [text]
-    for i, c in enumerate(chunks, 1):
-        (chunk_dir / f"part{i:02d}.txt").write_text(c, encoding="utf-8")
-    return len(chunks)
+    scan_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(clean_path, scan_dir / doc_name)
 
 
 def ingest(
@@ -73,7 +67,7 @@ def ingest(
     doc_name: str,
     backend: str,
     model: str,
-    chunk_size: int,
+    token_budget: int,
     proceed: bool,
     transcript: Path | None = None,
     video: Path | None = None,
@@ -118,12 +112,11 @@ def ingest(
         # wire_sources finds node labels at consistent positions.
         shutil.copyfile(clean_path, src_copy)
 
-    # Step 3 — preflight (local, free) — the HARD STOP before any paid call.
-    chunk_dir = work / "chunked"
-    n = _chunk(clean_path, chunk_dir, chunk_size)  # step 4, local
-    print(f"  chunked into {n} part(s)", flush=True)
+    # Step 3 — stage the whole doc, then preflight (the HARD STOP before paid).
+    scan_dir = work / "scan"
+    _stage_source(clean_path, doc_name, scan_dir)
     print("\n--- PREFLIGHT (cost gate) ---")
-    subprocess.run([sys.executable, str(PREFLIGHT), str(chunk_dir)])  # informational
+    subprocess.run([sys.executable, str(PREFLIGHT), str(scan_dir)])  # informational
     if not proceed:
         print(
             "\nStopping before the paid Gemini extract. Re-run with --yes to proceed.",
@@ -131,29 +124,32 @@ def ingest(
         )
         raise SystemExit(0)
 
-    # Step 5 — extract (PAID: the one Gemini call). graphify uses cwd's
-    # graphify-out/, so run from inside chunk_dir.
-    _run(["graphify", "extract", ".", "--backend", backend, "--model", model], cwd=str(chunk_dir))
+    # Step 4 — extract (PAID: the one Gemini call). graphify chunks by tokens
+    # itself; --token-budget tunes granularity. It uses cwd's graphify-out/, so
+    # run from inside scan_dir.
+    extract_cmd = ["graphify", "extract", ".", "--backend", backend, "--model", model]
+    if token_budget:
+        extract_cmd += ["--token-budget", str(token_budget)]
+    _run(extract_cmd, cwd=str(scan_dir))
 
-    # Step 6 — cluster + report (local + small Gemini naming call).
-    _run(["graphify", "cluster-only", "."], cwd=str(chunk_dir))
+    # Step 5 — cluster + report (local + small Gemini naming call).
+    _run(["graphify", "cluster-only", "."], cwd=str(scan_dir))
 
-    # Step 7 — export Obsidian vault (local, free).
-    _run(["graphify", "export", "obsidian", "."], cwd=str(chunk_dir))
+    # Step 6 — export Obsidian vault (local, free).
+    _run(["graphify", "export", "obsidian", "."], cwd=str(scan_dir))
 
-    # Step 8 — wire every node to the one source doc (local, free). All chunks
-    # (part01, part02, ...) collapse onto the canonical transcript copy.
-    vault = chunk_dir / "graphify-out" / "obsidian"
+    # Step 7 — wire every node to the one source doc (local, free).
+    vault = scan_dir / "graphify-out" / "obsidian"
     _run([
         sys.executable, str(WIRE), str(vault),
         "--src-dir", str(work),
-        "--map", f"part:{doc_name}",
+        "--map", f"{Path(doc_name).stem}:{doc_name}",
     ])
     return vault
 
 
 def _self_check() -> int:
-    # Verify orchestration plumbing without graphify or network: clean + chunk
+    # Verify orchestration plumbing without graphify or network: clean + stage
     # + preflight wiring, stopping at the gate.
     import tempfile
 
@@ -171,20 +167,22 @@ def _self_check() -> int:
                 doc_name="raw.txt",
                 backend="gemini",
                 model="gemini-2.5-flash",
-                chunk_size=4000,
+                token_budget=0,
                 proceed=False,  # must stop at the gate, never reach graphify
             )
         except SystemExit as e:
             assert e.code == 0, f"should stop cleanly at gate, got {e.code}"
         else:
             raise AssertionError("should have stopped at the preflight gate")
-        # clean + chunk happened before the gate
+        # clean + stage happened before the gate
         assert (work / "clean_transcript.txt").exists(), "clean step did not run"
         cleaned = (work / "clean_transcript.txt").read_text()
         assert "[Music]" not in cleaned and "test test" not in cleaned, cleaned
-        assert list((work / "chunked").glob("part*.txt")), "chunking did not run"
+        # the WHOLE doc is staged for graphify (no pre-chunking)
+        assert (work / "scan" / "raw.txt").exists(), "source not staged for scan"
+        assert (work / "scan" / "raw.txt").read_text() == cleaned, "staged != cleaned"
         # invariant: the canonical doc nodes link to == the cleaned text that
-        # gets chunked/searched, so wire_sources finds labels at stable offsets.
+        # gets searched, so wire_sources finds labels at stable offsets.
         assert (work / "raw.txt").read_text() == cleaned, "canonical doc must equal cleaned text"
     print("self-check OK")
     return 0
@@ -199,7 +197,8 @@ def main() -> int:
     ap.add_argument("--doc-name", help="canonical source-doc filename in the vault (default: source's name)")
     ap.add_argument("--backend", default="gemini")
     ap.add_argument("--model", default="gemini-2.5-flash")
-    ap.add_argument("--chunk-size", type=int, default=4000, help="Chonkie chunk size in CHARACTERS")
+    ap.add_argument("--token-budget", type=int, default=0,
+                    help="graphify per-chunk token budget (0 = graphify default ~60k)")
     ap.add_argument("--whisper-model", default="small", help="faster-whisper model when --video is used")
     ap.add_argument("--threads", type=int, default=2, help="CPU threads for transcription")
     ap.add_argument("--prompt", default="", help="Whisper domain hint to fix technical vocab")
@@ -222,7 +221,7 @@ def main() -> int:
         doc_name=doc_name,
         backend=args.backend,
         model=args.model,
-        chunk_size=args.chunk_size,
+        token_budget=args.token_budget,
         proceed=args.yes,
         transcript=None if args.video else source,
         video=source if args.video else None,
