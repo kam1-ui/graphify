@@ -41,6 +41,8 @@ cookies.txt
 # Local video/transcript test artifacts
 raw/
 video_input/
+work/
+sessions-out/
 
 # Gemini API key (secret)
 .gemini.key

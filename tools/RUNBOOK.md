@@ -48,14 +48,49 @@ pour voir le preflight, puis relance avec `--yes` si le coût convient.
 > après coup (ça désynchronise les offsets — cf. revue adversariale). ingest.py
 > respecte déjà cet invariant (saute clean.py pour les vidéos).
 
+## Étape 0 — Capture OBS (sur ton PC) + transfert au VPS
+
+Pour du contenu **streamé/protégé** auquel tu as accès légalement (ton
+abonnement payé, usage perso d'étude) : on **capture l'écran** avec OBS plutôt
+que de télécharger un fichier. La capture se fait **sur ton PC** (OBS y est, il
+a un écran) — PAS sur le VPS (CPU-only, headless, risque de surchauffe).
+
+**OBS (PC) :**
+1. Ouvre l'épisode dans ton navigateur.
+2. OBS → source **Display Capture** (ou Window Capture sur l'onglet) + capture
+   de l'**audio du bureau/système** (Desktop Audio), pas le micro.
+3. Réglages (Settings → Output) : format **MP4**, ~1080p, 30 fps, bitrate
+   modéré (~2500 kbps). La transcription ne lit que l'**audio** → inutile de
+   viser une qualité vidéo élevée ; ça allège juste le fichier.
+4. Start Recording → laisse jouer l'épisode entier → Stop.
+5. Renomme : `episode-NN-titre.mp4`. Ce nom devient l'identité dans le vault.
+
+**Transfert PC → VPS** (les .mp4 sont gros → pas par git, qui les ignore) :
+```bash
+scp episode-03-titre.mp4 dev-work@VPS:~/graphify/video_input/
+# reprise possible sur gros fichier :
+rsync -P episode-03-titre.mp4 dev-work@VPS:~/graphify/video_input/
+```
+
+> ponytail : la capture reste manuelle (1 clic Start/Stop par épisode). On
+> n'automatise PAS OBS+Chrome headless sur le VPS — Xvfb+Playwright sur un CPU
+> qui a déjà fondu = fragile et lent pour un gain marginal. Si tu veux
+> semi-automatiser, fais-le sur le PC (Playwright local lance la lecture, OBS
+> enregistre), jamais sur le VPS.
+
+À partir d'ici, le `.mp4` est sur le VPS → utilise la **voie rapide** ci-dessus
+(`ingest.py --video`), ou la procédure manuelle détaillée ci-dessous.
+
 ## Procédure manuelle (détaillée / dépannage)
 
-Variables : `VIDEO_URL`, `WORK=<dossier de travail>`.
+Variables : `VIDEO=<chemin .mp4>`, `WORK=<dossier de travail>`.
 
-### 1. Télécharger + transcrire — *local, gratuit*
+### 1. Transcrire le .mp4 capturé — *local, gratuit*
 ```bash
-# audio via yt-dlp (cookies/EJS déjà gérés par graphify/transcribe.py), puis
-# faster-whisper pour le texte. Sortie attendue : WORK/raw_transcript.txt
+# faster-whisper sur le fichier OBS → texte + sidecar timestamps.
+python tools/transcribe_ts.py "$VIDEO" --out "$WORK" --model small --threads 2
+# Sortie : WORK/<stem>.txt + WORK/<stem>.map.json
+# (pour une URL téléchargeable, yt-dlp+cookies/EJS via graphify/transcribe.py)
 ```
 **Vérifier :** `raw_transcript.txt` existe et contient du texte.
 
