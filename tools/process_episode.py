@@ -97,6 +97,23 @@ def ffprobe_duration(video: Path) -> str:
         return "?"
 
 
+def _content_duration(sidecar: Path | None, video: Path) -> str:
+    """Real content length: last sidecar timestamp if available, else ffprobe.
+
+    Uses the transcript's last segment so the fiche shows the actual content
+    duration (e.g. 2h), not the raw recording (e.g. 3h46 with a dead tail).
+    """
+    if sidecar is not None and sidecar.exists():
+        try:
+            segs = json.loads(sidecar.read_text(encoding="utf-8")).get("segments") or []
+            if segs:
+                s = int(segs[-1]["start"])
+                return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+        except (ValueError, KeyError):
+            pass
+    return ffprobe_duration(video)
+
+
 def god_nodes(graph_json: Path, n: int = 8) -> list[str]:
     """The n most-connected concept labels — free, read from the graph."""
     g = json.loads(graph_json.read_text(encoding="utf-8"))
@@ -190,7 +207,16 @@ def process(src: str, title: str | None, author: str | None, proceed: bool,
         if not original.exists():
             raise SystemExit(f"not found: {original}")
 
-    slug = slugify(original.name)
+    # 4. Resolve title/author FIRST so the slug can be built from the title
+    # (a readable slug like "live-session-14-may-2026" beats the raw filename).
+    if title is None:
+        title = input(f"Titre [{original.stem}] : ").strip() if interactive else original.stem
+        title = title or original.stem
+    if author is None:
+        author = input("Auteur [unknown] : ").strip() if interactive else "unknown"
+        author = author or "unknown"
+
+    slug = slugify(title)
     ep_dir = EPISODES / slug
 
     # IDEMPOTENCY: refuse to clobber an already-processed episode.
@@ -214,15 +240,9 @@ def process(src: str, title: str | None, author: str | None, proceed: bool,
         fixed.write_text(_json.dumps(sc), encoding="utf-8")
         sidecar = fixed
 
-    # 3. Auto metadata (zero token) — from the content we actually process.
-    duration = ffprobe_duration(video)
-    # 4. Missing title/author: prompt if a human is here, else safe defaults.
-    if title is None:
-        title = input(f"Titre [{video.stem}] : ").strip() if interactive else video.stem
-        title = title or video.stem
-    if author is None:
-        author = input("Auteur [unknown] : ").strip() if interactive else "unknown"
-        author = author or "unknown"
+    # 3. Duration = the REAL content length, not the raw file. With a sidecar,
+    # take the last timestamp (the trimmed/transcribed content); else ffprobe.
+    duration = _content_duration(sidecar, video)
 
     # 5-6. Preflight + extract via ingest.py (cost-gate: needs --yes).
     # FIX: run in a temp WORK dir OUTSIDE the repo, because episodes/ is listed
