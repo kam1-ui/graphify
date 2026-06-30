@@ -46,3 +46,8 @@ sessions-out/
 
 # Gemini API key (secret)
 .gemini.key
+
+# Episode processing workflow (local)
+a-traiter/
+traite/
+episodes/
