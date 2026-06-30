@@ -175,7 +175,9 @@ def update_index(slug: str, title: str, duration: str, stats: dict) -> None:
 
 
 def process(src: str, title: str | None, author: str | None, proceed: bool,
-            force: bool, interactive: bool, until: str | None = None) -> Path:
+            force: bool, interactive: bool, until: str | None = None,
+            transcript_done: Path | None = None, sidecar: Path | None = None,
+            token_budget: int = 4000) -> Path:
     A_TRAITER.mkdir(exist_ok=True)
     TRAITE.mkdir(exist_ok=True)
 
@@ -197,8 +199,20 @@ def process(src: str, title: str | None, author: str | None, proceed: bool,
 
     # Optional: trim dead tail BEFORE processing (free, local). The trimmed file
     # is what gets transcribed/graphed and is the timestamp reference. The
-    # ORIGINAL is what moves to traite/ (source of record).
-    video = trim_video(original, until) if until else original
+    # ORIGINAL is what moves to traite/ (source of record). Skip trimming when a
+    # transcript is already supplied (it was produced from the right cut).
+    video = trim_video(original, until) if (until and transcript_done is None) else original
+
+    # FIX: point the timestamp deep-links at the real VIDEO file, not the audio
+    # the sidecar happens to name. wire_sources reads sidecar['video'] — rewrite
+    # it to the original video so clicking a node opens the .mp4.
+    if sidecar is not None:
+        import json as _json
+        sc = _json.loads(sidecar.read_text(encoding="utf-8"))
+        sc["video"] = original.name
+        fixed = sidecar.with_name(sidecar.stem + ".fixed.json")
+        fixed.write_text(_json.dumps(sc), encoding="utf-8")
+        sidecar = fixed
 
     # 3. Auto metadata (zero token) — from the content we actually process.
     duration = ffprobe_duration(video)
@@ -211,9 +225,25 @@ def process(src: str, title: str | None, author: str | None, proceed: bool,
         author = author or "unknown"
 
     # 5-6. Preflight + extract via ingest.py (cost-gate: needs --yes).
-    work = ep_dir
-    cmd = [sys.executable, str(INGEST), "--video", str(video), "--work", str(work),
-           "--doc-name", f"{slug}-transcript.txt"]
+    # FIX: run in a temp WORK dir OUTSIDE the repo, because episodes/ is listed
+    # in the repo's .graphifyignore (so a scan dir inside it is ignored and the
+    # transcript is never detected). We copy the result into episodes/<slug>/
+    # afterwards.
+    import tempfile
+    tmp = Path(tempfile.mkdtemp(prefix=f"ep_{slug}_"))
+    work = tmp
+    doc_name = f"{slug}-transcript.txt"
+    cmd = [sys.executable, str(INGEST), "--work", str(work), "--doc-name", doc_name]
+    if transcript_done is not None:
+        # Transcript already produced (e.g. on a rented GPU): skip transcription,
+        # feed the text + its timestamp sidecar straight in (no re-clean).
+        cmd += ["--transcript", str(transcript_done)]
+        if sidecar is not None:
+            cmd += ["--sidecar", str(sidecar)]
+    else:
+        cmd += ["--video", str(video)]
+    if token_budget:
+        cmd += ["--token-budget", str(token_budget)]
     if proceed:
         cmd.append("--yes")
     # ATOMICITY: everything below must succeed before we move the video.
@@ -224,9 +254,16 @@ def process(src: str, title: str | None, author: str | None, proceed: bool,
         raise SystemExit("ingest did not complete (cost-gate or error) — "
                          "video left in a-traiter/. Re-run with --yes to proceed.")
 
-    graph_json = work / "graphify-out" / "graph.json"
+    # ingest runs graphify from inside work/scan/, so the output lands there.
+    out_dir = work / "scan" / "graphify-out"
+    graph_json = out_dir / "graph.json"
     if not graph_json.exists():
         raise SystemExit(f"no graph produced at {graph_json} — video left in place.")
+
+    # Move the produced output into episodes/<slug>/ (out of the ignored temp).
+    import shutil as _sh
+    ep_dir.mkdir(parents=True, exist_ok=True)
+    _sh.copytree(out_dir, ep_dir / "graphify-out", dirs_exist_ok=True)
 
     # 7-8. Réinjection: fiche + index from the REAL produced content (free).
     topics = god_nodes(graph_json)
@@ -315,6 +352,10 @@ def main() -> int:
     ap.add_argument("--title")
     ap.add_argument("--author")
     ap.add_argument("--until", help="trim the video at HH:MM:SS before processing (cuts dead tail)")
+    ap.add_argument("--transcript", help="already-produced transcript (e.g. from a GPU run); skips transcription")
+    ap.add_argument("--sidecar", help="timestamp .map.json that goes with --transcript")
+    ap.add_argument("--token-budget", type=int, default=4000,
+                    help="graphify per-chunk token budget (smaller avoids truncated chunks; default 4000)")
     ap.add_argument("--yes", action="store_true", help="proceed past the paid cost-gate")
     ap.add_argument("--force", action="store_true", help="reprocess even if the episode exists")
     args = ap.parse_args()
@@ -323,7 +364,10 @@ def main() -> int:
         return _self_check()
 
     process(args.source, args.title, args.author, proceed=args.yes,
-            force=args.force, interactive=sys.stdin.isatty(), until=args.until)
+            force=args.force, interactive=sys.stdin.isatty(), until=args.until,
+            transcript_done=Path(args.transcript) if args.transcript else None,
+            sidecar=Path(args.sidecar) if args.sidecar else None,
+            token_budget=args.token_budget)
     return 0
 
 

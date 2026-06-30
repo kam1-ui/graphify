@@ -71,6 +71,7 @@ def ingest(
     proceed: bool,
     transcript: Path | None = None,
     video: Path | None = None,
+    sidecar: Path | None = None,
     whisper_model: str = "small",
     threads: int = 2,
     prompt: str = "",
@@ -101,8 +102,17 @@ def ingest(
             shutil.copyfile(txt_path, src_copy)
             shutil.copyfile(_map_path, work / (Path(doc_name).stem + ".map.json"))
         clean_path = src_copy  # already clean; no second pass
+    elif sidecar is not None:
+        # Already-clean transcript WITH a timestamp sidecar (e.g. from a GPU run
+        # via transcribe_gpu.py). DO NOT re-clean — that would shift char offsets
+        # and break the sidecar's node→timestamp mapping. Copy text + sidecar as
+        # the atomic pair, exactly like the video path.
+        assert transcript is not None
+        shutil.copyfile(transcript, src_copy)
+        shutil.copyfile(sidecar, work / (Path(doc_name).stem + ".map.json"))
+        clean_path = src_copy
     else:
-        # Text source: copy it in, then clean (local, free).
+        # Text source, no sidecar: copy it in, then clean (local, free).
         assert transcript is not None
         if transcript.resolve() != src_copy.resolve():
             shutil.copyfile(transcript, src_copy)
@@ -202,6 +212,7 @@ def main() -> int:
     ap.add_argument("--whisper-model", default="small", help="faster-whisper model when --video is used")
     ap.add_argument("--threads", type=int, default=2, help="CPU threads for transcription")
     ap.add_argument("--prompt", default="", help="Whisper domain hint to fix technical vocab")
+    ap.add_argument("--sidecar", help="timestamp .map.json for an already-clean --transcript (skips re-clean)")
     ap.add_argument("--yes", action="store_true", help="proceed past the cost gate (paid Gemini call)")
     args = ap.parse_args()
 
@@ -225,6 +236,7 @@ def main() -> int:
         proceed=args.yes,
         transcript=None if args.video else source,
         video=source if args.video else None,
+        sidecar=Path(args.sidecar) if args.sidecar else None,
         whisper_model=args.whisper_model,
         threads=args.threads,
         prompt=args.prompt,
