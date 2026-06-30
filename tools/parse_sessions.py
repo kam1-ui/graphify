@@ -72,9 +72,54 @@ def _blocks_text(content) -> list[str]:
     return out
 
 
+# Frontmatter enrichment (graphify issue #425: these map to graph nodes).
+# We keep the FULL conversation — these are just metadata in the header, not a
+# digest. We reject the reference repo's char-cap "digest" approach outright.
+_STOP = {
+    # English function words
+    "the", "and", "for", "that", "this", "with", "you", "your", "are", "was",
+    "but", "not", "can", "have", "has", "our", "what", "how", "why", "all",
+    "one", "from", "into", "out", "now", "just", "more", "than", "then",
+    # French function words (the user writes mostly in French)
+    "ok", "oui", "non", "est", "les", "des", "une", "pas", "sur", "dans",
+    "qui", "que", "pour", "avec", "par", "mais", "ton", " tes", "ces", "cette",
+    "cest", "donc", "sont", "fais", "fait", "faire", "vais", "plus", "bien",
+    "ele", "elle", "leur", "nous", "vous", "comme", "tout", "tous", "peux",
+    "etre", "veux", "aussi", "encore", "deja", "quon", "quand", "selon",
+    # domain words too frequent to be a useful topic
+    "graphify", "session", "user", "assistant",
+}
+_WORD = re.compile(r"[a-zA-Zàâéèêëîïôûùç_][\w\-]{2,}")
+
+
+def _files_touched(content) -> list[str]:
+    """Paths from Write/Edit tool_use blocks in an assistant message."""
+    out = []
+    for b in content if isinstance(content, list) else []:
+        if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") in ("Write", "Edit"):
+            fp = (b.get("input") or {}).get("file_path")
+            if fp:
+                out.append(fp)
+    return out
+
+
+def _topics(texts: list[str], n: int = 12) -> list[str]:
+    """The n most frequent meaningful words across the conversation text."""
+    from collections import Counter
+
+    c: Counter = Counter()
+    for t in texts:
+        for w in _WORD.findall(t.lower()):
+            if w not in _STOP:
+                c[w] += 1
+    return [w for w, _ in c.most_common(n)]
+
+
 def parse_session(path: Path) -> tuple[str, dict] | None:
     """Extract the conversation from one .jsonl into (markdown, metadata)."""
     turns: list[tuple[str, str]] = []  # (role, text)
+    all_text: list[str] = []
+    files: list[str] = []
     first_ts = None
     session_id = path.stem
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -89,8 +134,11 @@ def parse_session(path: Path) -> tuple[str, dict] | None:
         if t not in ("user", "assistant"):
             continue
         msg = o.get("message", {})
-        # A "user" entry that is really a tool_result is noise, not a prompt.
         content = msg.get("content")
+        # Collect files touched even from tool_use blocks we don't keep as text.
+        if t == "assistant":
+            files.extend(_files_touched(content))
+        # A "user" entry that is really a tool_result is noise, not a prompt.
         if t == "user" and isinstance(content, list) and not any(
             isinstance(b, dict) and b.get("type") == "text" for b in content
         ):
@@ -100,17 +148,26 @@ def parse_session(path: Path) -> tuple[str, dict] | None:
             continue  # assistant thinking/tool_use only -> skip
         if first_ts is None:
             first_ts = o.get("timestamp")
-        turns.append((t, "\n\n".join(texts)))
+        joined = "\n\n".join(texts)
+        turns.append((t, joined))
+        all_text.append(joined)
 
     if not turns:
         return None
 
     date = (first_ts or "")[:10] or "unknown"
+    topics = _topics(all_text)
+    files_touched = sorted(set(files))
+
     lines = [
         "---",
         f"date: {date}",
         f"session_id: {session_id}",
-        f"source: claude-code-session",
+        "source: claude-code-session",
+        "topics:",
+        *[f"  - {redact(t)}" for t in topics],
+        "files_touched:",
+        *[f"  - {f}" for f in files_touched],
         "tags:",
         "  - conversation",
         "---",
@@ -124,7 +181,10 @@ def parse_session(path: Path) -> tuple[str, dict] | None:
         lines.append("")
         lines.append(redact(text))
         lines.append("")
-    return "\n".join(lines), {"date": date, "session_id": session_id, "turns": len(turns)}
+    return "\n".join(lines), {
+        "date": date, "session_id": session_id, "turns": len(turns),
+        "topics": topics, "files_touched": files_touched,
+    }
 
 
 def _find_workspace_dir(name: str) -> Path | None:
@@ -164,10 +224,13 @@ def _self_check() -> int:
     sample = [
         {"type": "queue-operation", "operation": "enqueue"},  # noise
         {"type": "user", "timestamp": "2026-06-30T10:00:00Z",
-         "message": {"content": [{"type": "text", "text": "ma cle est AQ.Ab8RN6SECRETkey1234567890 garde-la"}]}},
+         "message": {"content": [{"type": "text", "text": "ma cle est AQ.Ab8RN6SECRETkey1234567890 corrige le backend ollama"}]}},
         {"type": "assistant",
-         "message": {"content": [{"type": "thinking", "thinking": "hidden"},
-                                  {"type": "text", "text": "Compris, je la masque."}]}},
+         "message": {"content": [
+             {"type": "thinking", "thinking": "hidden"},
+             {"type": "tool_use", "name": "Edit", "input": {"file_path": "graphify/llm.py"}},
+             {"type": "text", "text": "Backend ollama corrige dans llm.py."},
+         ]}},
         {"type": "user",  # tool_result masquerading as user -> dropped
          "message": {"content": [{"tool_use_id": "x", "type": "tool_result", "content": "out"}]}},
     ]
@@ -177,10 +240,15 @@ def _self_check() -> int:
         md, meta = parse_session(f)
         assert meta["turns"] == 2, meta  # 1 user + 1 assistant text; noise dropped
         assert "## User" in md and "## Assistant" in md, md
-        assert "Compris" in md and "hidden" not in md, "thinking must be dropped"
+        assert "Compris" not in md and "hidden" not in md, "thinking must be dropped"
         assert "AQ.Ab8RN6SECRET" not in md and "[REDACTED]" in md, "secret must be redacted"
         assert "tool_result" not in md and "out" not in md.split("Assistant")[0], "tool noise leaked"
         assert meta["date"] == "2026-06-30", meta
+        # enriched frontmatter
+        assert meta["files_touched"] == ["graphify/llm.py"], meta
+        assert "files_touched:" in md and "graphify/llm.py" in md
+        assert "ollama" in meta["topics"] and "backend" in meta["topics"], meta["topics"]
+        assert "the" not in meta["topics"] and "graphify" not in meta["topics"], "stop-words leaked"
     # redact() unit
     assert redact("token ghp_ABCDEFGHIJKLMNOPQRST1234") == "token [REDACTED]"
     assert redact("plain text stays") == "plain text stays"
