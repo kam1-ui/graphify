@@ -62,6 +62,27 @@ def slugify(name: str) -> str:
     return s or "episode"
 
 
+def trim_video(video: Path, until: str) -> Path:
+    """Cut the video at `until` (HH:MM:SS) before processing, free and local.
+
+    Recorded streams often have dead tail (frozen frame, no audio — e.g. you
+    fell asleep). Trimming to the real content cuts transcription time in half
+    and avoids Whisper hallucinating on silence. `-c copy` stream-copies (no
+    re-encode), so it's near-instant. The trimmed file becomes the reference,
+    so timestamps stay consistent — no remapping needed (nothing useful is past
+    `until` anyway).
+    """
+    out = video.with_name(f"{video.stem}.trim{video.suffix}")
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-i", str(video), "-t", until, "-c", "copy", str(out)],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0 or not out.exists():
+        raise SystemExit(f"trim failed: {r.stderr[-300:]}")
+    print(f"  trimmed to {until} -> {out.name}", flush=True)
+    return out
+
+
 def ffprobe_duration(video: Path) -> str:
     """HH:MM:SS via ffprobe, or '?' if unavailable."""
     try:
@@ -154,27 +175,32 @@ def update_index(slug: str, title: str, duration: str, stats: dict) -> None:
 
 
 def process(src: str, title: str | None, author: str | None, proceed: bool,
-            force: bool, interactive: bool) -> Path:
+            force: bool, interactive: bool, until: str | None = None) -> Path:
     A_TRAITER.mkdir(exist_ok=True)
     TRAITE.mkdir(exist_ok=True)
 
     # 1-2. Resolve input: a url downloads into a-traiter/ first (so ffprobe has
     # the file); a path is used as-is.
     if _URL.match(src):
-        video = _download(src)
+        original = _download(src)
     else:
-        video = Path(src)
-        if not video.exists():
-            raise SystemExit(f"not found: {video}")
+        original = Path(src)
+        if not original.exists():
+            raise SystemExit(f"not found: {original}")
 
-    slug = slugify(video.name)
+    slug = slugify(original.name)
     ep_dir = EPISODES / slug
 
     # IDEMPOTENCY: refuse to clobber an already-processed episode.
     if ep_dir.exists() and not force:
         raise SystemExit(f"already processed: {ep_dir} (use --force to redo)")
 
-    # 3. Auto metadata (zero token).
+    # Optional: trim dead tail BEFORE processing (free, local). The trimmed file
+    # is what gets transcribed/graphed and is the timestamp reference. The
+    # ORIGINAL is what moves to traite/ (source of record).
+    video = trim_video(original, until) if until else original
+
+    # 3. Auto metadata (zero token) — from the content we actually process.
     duration = ffprobe_duration(video)
     # 4. Missing title/author: prompt if a human is here, else safe defaults.
     if title is None:
@@ -208,11 +234,14 @@ def process(src: str, title: str | None, author: str | None, proceed: bool,
     write_fiche(ep_dir, slug, title, author, duration, video.name, topics, stats)
     update_index(slug, title, duration, stats)
 
-    # 9. LAST: move the video out of the drop zone (only now it's all done).
-    dest = TRAITE / video.name
-    if video.resolve() != dest.resolve():
-        video.rename(dest)
-    print(f"\nDone: episodes/{slug}/  (video -> traite/{video.name})", flush=True)
+    # 9. LAST: move the ORIGINAL out of the drop zone (only now it's all done).
+    # The trimmed temp file (if any) is discarded — graphify-out keeps the copy.
+    if until and video != original and video.exists():
+        video.unlink()
+    dest = TRAITE / original.name
+    if original.resolve() != dest.resolve():
+        original.rename(dest)
+    print(f"\nDone: episodes/{slug}/  (video -> traite/{original.name})", flush=True)
     return ep_dir
 
 
@@ -264,6 +293,18 @@ def _self_check() -> int:
         idx = INDEX.read_text()
         assert idx.count("[ep01](") == 1, "slug line must not duplicate"
         assert "v2" in idx, "re-run should update the line in place"
+
+        # trim_video: make a 4s tone, trim to 2s, check the result is shorter.
+        src = Path(td) / "tone.wav"
+        subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=duration=4",
+                        str(src)], capture_output=True)
+        if src.exists():
+            trimmed = trim_video(src, "00:00:02")
+            assert trimmed.exists() and trimmed != src, trimmed
+            assert float(subprocess.run(
+                ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", str(trimmed)], capture_output=True, text=True
+            ).stdout) < 3.5, "trimmed clip should be ~2s"
     print("self-check OK")
     return 0
 
@@ -273,6 +314,7 @@ def main() -> int:
     ap.add_argument("source", nargs="?", help="video path or url (omit to self-check)")
     ap.add_argument("--title")
     ap.add_argument("--author")
+    ap.add_argument("--until", help="trim the video at HH:MM:SS before processing (cuts dead tail)")
     ap.add_argument("--yes", action="store_true", help="proceed past the paid cost-gate")
     ap.add_argument("--force", action="store_true", help="reprocess even if the episode exists")
     args = ap.parse_args()
@@ -281,7 +323,7 @@ def main() -> int:
         return _self_check()
 
     process(args.source, args.title, args.author, proceed=args.yes,
-            force=args.force, interactive=sys.stdin.isatty())
+            force=args.force, interactive=sys.stdin.isatty(), until=args.until)
     return 0
 
 
