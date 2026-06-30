@@ -48,7 +48,45 @@ import tempfile
 from pathlib import Path
 
 _SOURCE_FILE = re.compile(r'^source_file:\s*"?(.*?)"?\s*$', re.MULTILINE)
+_NODE_LABEL = re.compile(r'^# (.+)$', re.MULTILINE)
 _MARKER = "## Source"
+
+
+def _load_sidecar(src_dir: Path, canonical: str) -> dict | None:
+    """Load <canonical>.map.json (the timestamp sidecar) if it exists."""
+    stem = _vault_link_name(canonical)
+    p = src_dir / f"{stem}.map.json"
+    if not p.exists():
+        return None
+    import json
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def _timestamp_for(label: str, source_text: str, sidecar: dict) -> dict | None:
+    """Pick the video timestamp for a node (decision: label-search w/ fallback).
+
+    Find where the node's label appears in the source text; map that char
+    position to the latest segment that starts at or before it. If the label
+    isn't found verbatim, fall back to the first segment (start of the doc).
+    Returns the chosen segment dict ({offset,start,hms}) or None if no segments.
+    """
+    segs = sidecar.get("segments") or []
+    if not segs:
+        return None
+    pos = source_text.lower().find(label.lower())
+    if pos < 0:
+        return segs[0]  # fallback: couldn't locate the label, use doc start
+    candidates = [s for s in segs if s["offset"] <= pos]
+    return max(candidates, key=lambda s: s["offset"]) if candidates else segs[0]
+
+
+def _video_link(sidecar: dict, seg: dict) -> str:
+    """Build a clickable deep-link into the local video at the timestamp."""
+    video = sidecar.get("video", "")
+    # ponytail: local file link with a media fragment (#t=seconds). Obsidian
+    # opens it; the fragment lets players seek. Upgrade: emit a YouTube
+    # ?t=Ns link instead when the video lives online (we keep start in s).
+    return f"[{seg['hms']}](file://{video}#t={int(seg['start'])})"
 
 
 def _resolve(source_file: str, mapping: list[tuple[str, str]]) -> str:
@@ -72,6 +110,8 @@ def wire(vault: Path, src_dir: Path, mapping: list[tuple[str, str]]) -> tuple[in
 
     wired = 0
     copied: set[str] = set()
+    # Cache per canonical doc: its source text + timestamp sidecar (if any).
+    cache: dict[str, tuple[str, dict | None]] = {}
 
     for note in vault.glob("*.md"):
         text = note.read_text(encoding="utf-8")
@@ -83,10 +123,10 @@ def wire(vault: Path, src_dir: Path, mapping: list[tuple[str, str]]) -> tuple[in
 
         canonical = _resolve(m.group(1).strip(), mapping)
         link_stem = _vault_link_name(canonical)
+        src = src_dir / canonical
 
         # Copy the source into the vault (once), as .md so Obsidian opens it.
         if canonical not in copied:
-            src = src_dir / canonical
             dst = sources_dir / f"{link_stem}.md"
             if src.exists():
                 if not dst.exists():
@@ -96,7 +136,20 @@ def wire(vault: Path, src_dir: Path, mapping: list[tuple[str, str]]) -> tuple[in
             # (dangling link in Obsidian) rather than skip — the node should
             # always advertise where it came from, even if the doc isn't here.
 
+        # Load source text + timestamp sidecar once per canonical doc.
+        if canonical not in cache:
+            stext = src.read_text(encoding="utf-8") if src.exists() else ""
+            cache[canonical] = (stext, _load_sidecar(src_dir, canonical))
+        source_text, sidecar = cache[canonical]
+
         section = f"{_MARKER}\n- [[sources/{link_stem}]]"
+        # If we have timestamps, deep-link this node into the video.
+        if sidecar:
+            label_m = _NODE_LABEL.search(text)
+            label = label_m.group(1).strip() if label_m else ""
+            seg = _timestamp_for(label, source_text, sidecar) if label else None
+            if seg:
+                section += f"\n- {_video_link(sidecar, seg)}"
         # Insert before the trailing inline-tags line if present (graphify ends
         # each note with a "#graphify/... " tag line), else append at the end.
         lines = text.rstrip("\n").split("\n")
@@ -143,6 +196,50 @@ def _self_check() -> int:
         w2, _ = wire(vault, srcdir, mapping)
         assert w2 == 0, "second run should wire nothing"
         assert node.read_text(encoding="utf-8").count("## Source") == 1
+
+    # --- timestamp path: a sidecar present -> node gets a deep-link ---
+    import json as _json
+
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td) / "vault"
+        srcdir = Path(td) / "in"
+        vault.mkdir()
+        srcdir.mkdir()
+        # source text: "Knowledge Graph" appears at a known offset.
+        src_text = "intro line about graphify\nThe Knowledge Graph maps concepts."
+        (srcdir / "lesson.txt").write_text(src_text, encoding="utf-8")
+        (srcdir / "lesson.map.json").write_text(
+            _json.dumps({
+                "video": "/videos/lesson.mp4",
+                "segments": [
+                    {"offset": 0, "start": 0.0, "hms": "00:00:00"},
+                    {"offset": 26, "start": 833.0, "hms": "00:13:53"},
+                ],
+            }),
+            encoding="utf-8",
+        )
+        node = vault / "Knowledge Graph.md"
+        node.write_text(
+            '---\nsource_file: "lesson.txt"\ntype: "concept"\n---\n\n'
+            "# Knowledge Graph\n\n#graphify/concept\n",
+            encoding="utf-8",
+        )
+        wire(vault, srcdir, [])
+        out = node.read_text(encoding="utf-8")
+        # "Knowledge Graph" is at offset 30 (>=26) -> second segment, 13:53.
+        assert "00:13:53" in out, out
+        assert "file:///videos/lesson.mp4#t=833" in out, out
+        # a node whose label isn't in the text falls back to the first segment.
+        node2 = vault / "Absent Concept.md"
+        node2.write_text(
+            '---\nsource_file: "lesson.txt"\ntype: "concept"\n---\n\n'
+            "# Absent Concept\n\n#graphify/concept\n",
+            encoding="utf-8",
+        )
+        wire(vault, srcdir, [])
+        out2 = node2.read_text(encoding="utf-8")
+        assert "00:00:00" in out2, out2  # fallback to doc start
+
     print("self-check OK")
     return 0
 
