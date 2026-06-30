@@ -23,7 +23,32 @@ une facture surprise.
   service account désactivé → régénérer la clé (jamais la coller en clair).
 - `yt-dlp` configuré (cookies + EJS) pour les téléchargements YouTube sur VPS.
 
-## Procédure
+## Voie rapide — une seule commande (recommandé pour les agents)
+
+`tools/ingest.py` enchaîne toute la procédure. Le **preflight reste un arrêt
+dur** : sans `--yes`, ça s'arrête avant tout appel payant à Gemini ; avec
+`--yes`, l'agent a explicitement accepté le coût.
+
+```bash
+K=$(grep -oE 'GEMINI_API_KEY=.*' ~/.gemini/.env | head -1 | cut -d= -f2- | tr -d '"')
+
+# Depuis un fichier vidéo (.mp4 OBS) : transcrit (timestamps) PUIS tout le reste.
+GEMINI_API_KEY="$K" python tools/ingest.py --video lesson.mp4 --work WORK \
+    --whisper-model small --threads 2 --yes
+
+# Depuis un transcript déjà produit :
+GEMINI_API_KEY="$K" python tools/ingest.py --transcript clean.txt --work WORK --yes
+```
+Sortie : un vault Obsidian dont chaque node a un lien source + un lien vidéo
+horodaté (`[14:13](file://…#t=853)`). Sans `--yes`, lance d'abord la commande
+pour voir le preflight, puis relance avec `--yes` si le coût convient.
+
+> Câblage timestamp : `--video` produit un sidecar `<doc>.map.json` aligné sur
+> le transcript nettoyé. Ne JAMAIS re-nettoyer ni re-chunker ce doc canonique
+> après coup (ça désynchronise les offsets — cf. revue adversariale). ingest.py
+> respecte déjà cet invariant (saute clean.py pour les vidéos).
+
+## Procédure manuelle (détaillée / dépannage)
 
 Variables : `VIDEO_URL`, `WORK=<dossier de travail>`.
 
