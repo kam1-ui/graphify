@@ -69,26 +69,54 @@ def _chunk(clean_path: Path, chunk_dir: Path, chunk_size: int) -> int:
 
 
 def ingest(
-    transcript: Path,
     work: Path,
     doc_name: str,
     backend: str,
     model: str,
     chunk_size: int,
     proceed: bool,
+    transcript: Path | None = None,
+    video: Path | None = None,
+    whisper_model: str = "small",
+    threads: int = 2,
+    prompt: str = "",
 ) -> Path:
     work.mkdir(parents=True, exist_ok=True)
 
-    # The canonical source doc nodes will link back to (runbook step 8 / the
-    # CHEAT CODE "many chunks -> one doc" model). Keep a copy in WORK so
-    # wire_sources can find it by name.
+    # The canonical source doc nodes link back to (runbook step 8 / the CHEAT
+    # CODE "many chunks -> one doc" model). It is the CLEANED transcript, and —
+    # critically — its char offsets must match the timestamp sidecar exactly, so
+    # nothing may rewrite it after it's produced (adversarial review: cleaning
+    # twice desyncs the map; chunking with a per-chunk doc desyncs it too — which
+    # is why every node collapses onto this one whole doc, never onto a chunk).
     src_copy = work / doc_name
-    if transcript.resolve() != src_copy.resolve():
-        shutil.copyfile(transcript, src_copy)
 
-    # Step 2 — clean (local, free).
-    clean_path = work / "clean_transcript.txt"
-    _run([sys.executable, str(CLEAN), str(src_copy), "--stats", "-o", str(clean_path)])
+    if video is not None:
+        # Step 1+2 — transcribe the video: produces the cleaned transcript AND an
+        # aligned <stem>.map.json sidecar in WORK. clean() is applied per-segment
+        # inside transcribe_ts, so we DO NOT run clean.py again (Option A): the
+        # text/sidecar are an atomic, already-clean pair.
+        import transcribe_ts  # noqa: E402  (tools/ is on sys.path)
+
+        txt_path, _map_path = transcribe_ts.transcribe(
+            video, work, whisper_model, threads, prompt
+        )
+        # Name the canonical doc + its sidecar after doc_name so wire_sources
+        # finds both by the same stem.
+        if txt_path.resolve() != src_copy.resolve():
+            shutil.copyfile(txt_path, src_copy)
+            shutil.copyfile(_map_path, work / (Path(doc_name).stem + ".map.json"))
+        clean_path = src_copy  # already clean; no second pass
+    else:
+        # Text source: copy it in, then clean (local, free).
+        assert transcript is not None
+        if transcript.resolve() != src_copy.resolve():
+            shutil.copyfile(transcript, src_copy)
+        clean_path = work / "clean_transcript.txt"
+        _run([sys.executable, str(CLEAN), str(src_copy), "--stats", "-o", str(clean_path)])
+        # Keep the canonical doc identical to what's chunked/searched, so
+        # wire_sources finds node labels at consistent positions.
+        shutil.copyfile(clean_path, src_copy)
 
     # Step 3 — preflight (local, free) — the HARD STOP before any paid call.
     chunk_dir = work / "chunked"
@@ -155,39 +183,52 @@ def _self_check() -> int:
         cleaned = (work / "clean_transcript.txt").read_text()
         assert "[Music]" not in cleaned and "test test" not in cleaned, cleaned
         assert list((work / "chunked").glob("part*.txt")), "chunking did not run"
+        # invariant: the canonical doc nodes link to == the cleaned text that
+        # gets chunked/searched, so wire_sources finds labels at stable offsets.
+        assert (work / "raw.txt").read_text() == cleaned, "canonical doc must equal cleaned text"
     print("self-check OK")
     return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run the video→graph→Obsidian pipeline end to end.")
-    ap.add_argument("--transcript", help="path to a raw transcript (omit to self-check)")
+    src = ap.add_mutually_exclusive_group()
+    src.add_argument("--video", help="video/audio file: transcribe (w/ timestamps) then ingest")
+    src.add_argument("--transcript", help="an already-produced transcript to ingest")
     ap.add_argument("--work", help="working dir for this ingestion")
-    ap.add_argument("--doc-name", help="canonical source-doc filename in the vault (default: transcript's name)")
+    ap.add_argument("--doc-name", help="canonical source-doc filename in the vault (default: source's name)")
     ap.add_argument("--backend", default="gemini")
     ap.add_argument("--model", default="gemini-2.5-flash")
     ap.add_argument("--chunk-size", type=int, default=4000, help="Chonkie chunk size in CHARACTERS")
+    ap.add_argument("--whisper-model", default="small", help="faster-whisper model when --video is used")
+    ap.add_argument("--threads", type=int, default=2, help="CPU threads for transcription")
+    ap.add_argument("--prompt", default="", help="Whisper domain hint to fix technical vocab")
     ap.add_argument("--yes", action="store_true", help="proceed past the cost gate (paid Gemini call)")
     args = ap.parse_args()
 
-    if not args.transcript:
+    if not args.video and not args.transcript:
         return _self_check()
     if not args.work:
         ap.error("--work is required")
 
-    transcript = Path(args.transcript)
-    if not transcript.exists():
-        ap.error(f"transcript not found: {transcript}")
-    doc_name = args.doc_name or transcript.name
+    source = Path(args.video or args.transcript)
+    if not source.exists():
+        ap.error(f"source not found: {source}")
+    # For a video, the canonical doc is the .txt transcript, not the .mp4.
+    doc_name = args.doc_name or (source.stem + ".txt" if args.video else source.name)
 
     vault = ingest(
-        transcript=transcript,
         work=Path(args.work),
         doc_name=doc_name,
         backend=args.backend,
         model=args.model,
         chunk_size=args.chunk_size,
         proceed=args.yes,
+        transcript=None if args.video else source,
+        video=source if args.video else None,
+        whisper_model=args.whisper_model,
+        threads=args.threads,
+        prompt=args.prompt,
     )
     print(f"\nDone. Open as an Obsidian vault: {vault}")
     return 0

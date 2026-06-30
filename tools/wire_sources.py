@@ -73,6 +73,14 @@ def _timestamp_for(label: str, source_text: str, sidecar: dict) -> dict | None:
     segs = sidecar.get("segments") or []
     if not segs:
         return None
+    # Invariant guard (adversarial review): the sidecar offsets are computed on
+    # the WHOLE cleaned transcript. If source_text isn't that same text — e.g.
+    # someone wired nodes to per-chunk docs instead of the one canonical doc —
+    # the offsets are meaningless and would yield wrong timestamps. Detect the
+    # mismatch: the last segment's offset must fall within this text. If not,
+    # refuse to stamp rather than emit a confidently-wrong link.
+    if segs[-1]["offset"] > len(source_text):
+        return None
     pos = source_text.lower().find(label.lower())
     if pos < 0:
         return segs[0]  # fallback: couldn't locate the label, use doc start
@@ -239,6 +247,12 @@ def _self_check() -> int:
         wire(vault, srcdir, [])
         out2 = node2.read_text(encoding="utf-8")
         assert "00:00:00" in out2, out2  # fallback to doc start
+
+        # invariant guard: a sidecar whose offsets exceed the source text (i.e.
+        # it belongs to a different/larger doc) must NOT stamp a wrong timestamp.
+        bad = {"video": "/v.mp4", "segments": [{"offset": 99999, "start": 5.0, "hms": "00:00:05"}]}
+        seg = _timestamp_for("knowledge graph", "short text", bad)
+        assert seg is None, "guard should refuse an out-of-range sidecar"
 
     print("self-check OK")
     return 0
