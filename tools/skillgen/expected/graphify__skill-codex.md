@@ -90,7 +90,7 @@ if ! "$PYTHON" -c "import graphify" 2>/dev/null; then
         if [ -n "$_UV_PY" ]; then PYTHON="$_UV_PY"; fi
     else
         "$PYTHON" -m pip install graphifyy -q 2>/dev/null \
-          || "$PYTHON" -m pip install graphifyy -q --break-system-packages 2>&1 | tail -3
+          || { echo "graphify not installed. Install it in an isolated env (uv tool install graphifyy, or a venv) and re-run; refusing to modify the system Python."; exit 1; }
     fi
 fi
 # Write interpreter path for all subsequent steps (persists across invocations)
