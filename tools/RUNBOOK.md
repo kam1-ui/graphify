@@ -10,6 +10,27 @@ une facture surprise.
 > intégration. On n'utilise jamais le skill `/graphify` ni `--backend claude-cli`
 > (ça brûle la session Claude Code).
 
+## Architecture code / données (2026-07-18)
+
+Le fork (`~/graphify`) = **code pur**, il ne reçoit jamais de données. Chaque
+corpus a son propre repo git (ex. `~/corpus-gex` pour la série GEX) qui contient
+les sources (`episodes/<slug>/`) **et** le graphe committé (`graphify-out/` —
+artefact de build versionné, doctrine « Team setup » du README graphify +
+issue #369 : un seul publisher régénère, tout le reste query).
+
+Conséquences pratiques :
+- `WORK` vit **toujours dans le repo corpus** : `WORK=~/corpus-gex/episodes/<slug>`.
+  graphify écrit dans le `graphify-out/` du répertoire courant → ne jamais
+  lancer une commande `graphify` avec un cwd dans `~/graphify`.
+- Les outils s'invoquent par chemin depuis le fork :
+  `python ~/graphify/tools/ingest.py --transcript "$WORK/….txt" --work "$WORK"`
+  (venv du fork désactivé : il masque l'install globale uv).
+- Média lourd (mp4/mp3/m4a, frames) : `~/video-staging/` ou `~/watch-runs/<slug>/`,
+  jamais dans un repo. Évidence légère (transcript, `.map.json`, ANALYSIS.md) :
+  copiée dans `episodes/<slug>/` et committée avant le run.
+- Après chaque (re)génération : `git add graphify-out/ && git commit` dans le
+  repo corpus. Une régénération faussée se répare par `git revert`.
+
 ## Pré-requis (une fois)
 
 - Clé Gemini valide dans `~/.gemini/.env` (`GEMINI_API_KEY=...`).
@@ -67,9 +88,9 @@ a un écran) — PAS sur le VPS (CPU-only, headless, risque de surchauffe).
 
 **Transfert PC → VPS** (les .mp4 sont gros → pas par git, qui les ignore) :
 ```bash
-scp episode-03-titre.mp4 dev-work@VPS:~/graphify/video_input/
+scp episode-03-titre.mp4 dev-work@VPS:~/video-staging/a-traiter/
 # reprise possible sur gros fichier :
-rsync -P episode-03-titre.mp4 dev-work@VPS:~/graphify/video_input/
+rsync -P episode-03-titre.mp4 dev-work@VPS:~/video-staging/a-traiter/
 ```
 
 > ponytail : la capture reste manuelle (1 clic Start/Stop par épisode). On
